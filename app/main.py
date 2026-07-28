@@ -75,6 +75,63 @@ def tts(
     tts(text, voice, model, output, play)
 
 @app.command()
+def say(
+    text: str = typer.Argument(..., help="What Jarvis should say"),
+    output: Path = typer.Option(None, help="Output file path"),
+    speed: float = typer.Option(1.0, help="Speaking rate (0.75–1.25 sounds natural)"),
+    play: bool = typer.Option(True, help="Play the audio after generation")
+):
+    """Speak text in the Jarvis voice (OpenAI TTS, fixed character)."""
+    from app.core.config import Config
+    from app.core.paths import Paths
+    from app.media.voice import JarvisVoice
+    from app.media.player import MediaPlayer
+    from rich.console import Console
+
+    console = Console()
+    config = Config()
+    paths = Paths(config)
+    voice_engine = JarvisVoice(config, paths)
+
+    if not voice_engine.configured:
+        console.print("[red]OPENAI_API_KEY is not configured — Jarvis has no voice.[/red]")
+        raise typer.Exit(code=1)
+
+    path = voice_engine.speak_to_file(text, output_path=output, speed=speed)
+    console.print(f"[green]Saved:[/green] {path}")
+
+    if play:
+        MediaPlayer(config, paths).play_audio(path)
+
+
+@app.command()
+def suite(
+    refresh: bool = typer.Option(False, help="Bypass the local cache")
+):
+    """Print the live MacTech Suite ops briefing."""
+    from app.suite.client import SuiteClient, SuiteUnavailable
+    from rich.console import Console
+
+    console = Console()
+    client = SuiteClient()
+
+    if not client.configured:
+        console.print(
+            "[red]SUITE_AGENT_BRIEFING_TOKEN is not set — Jarvis is not "
+            "connected to the Suite.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        briefing = client.fetch(force=refresh)
+    except SuiteUnavailable as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+    console.print(briefing.to_prompt_context())
+
+
+@app.command()
 def stt(
     audio_file: Path = typer.Argument(..., help="Audio file to transcribe"),
     language: str = typer.Option(None, help="Language code (e.g., 'en', 'es')"),
