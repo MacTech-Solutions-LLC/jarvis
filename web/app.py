@@ -15,6 +15,8 @@ from app.media.image_gen import ImageGenerator
 from app.media.tts import TextToSpeech
 from app.media.stt import SpeechToText
 from app.media.player import MediaPlayer
+from app.media.voice import JarvisVoice
+from app.suite.client import SuiteClient, SuiteUnavailable
 from web.theme import root_css_variables
 
 import httpx
@@ -72,6 +74,35 @@ def _ping_elevenlabs(api_key: Optional[str]) -> bool:
         return resp.status_code == 200
     except Exception:
         return False
+
+
+# Prepended to the system prompt whenever live suite state is attached,
+# so the model knows what the briefing is and how far it may go with it.
+JARVIS_SUITE_PERSONA = """You are Jarvis, the operations assistant for the MacTech \
+Suite. You have been given a live briefing of the suite's current state: every \
+registered app, its health, its open risk flags, and its Railway deployment status.
+
+Ground every claim about the suite in that briefing. If it does not contain \
+something you were asked about, say so plainly rather than estimating — a \
+fabricated number about production is worse than an admission of not knowing. \
+The operator is the person who runs this platform, so be direct and skip the \
+preamble.
+
+When helping plan work, reason from what the briefing actually shows: which apps \
+carry the most risk, what is unhealthy, what has drifted behind main. Propose \
+concrete next steps and name the tradeoffs."""
+
+
+def _render_audio(audio_bytes: bytes, autoplay: bool = False) -> None:
+    """Render an audio player, tolerating older Streamlit builds.
+
+    `autoplay` arrived in Streamlit 1.38. On anything older the player
+    still renders — the operator just presses play.
+    """
+    try:
+        st.audio(audio_bytes, format="audio/mp3", autoplay=autoplay)
+    except TypeError:
+        st.audio(audio_bytes, format="audio/mp3")
 
 
 st.set_page_config(
@@ -354,11 +385,16 @@ def init_app():
     tts_engine = TextToSpeech(config, paths)
     stt_engine = SpeechToText(config, paths)
     media_player = MediaPlayer(config, paths)
+    jarvis_voice = JarvisVoice(config, paths)
+    suite_client = SuiteClient()
     return (config, paths, workspace_manager, provider, kb_search, session_manager,
-            image_generator, tts_engine, stt_engine, media_player)
+            image_generator, tts_engine, stt_engine, media_player, jarvis_voice,
+            suite_client)
 
 
-config, paths, workspace_manager, provider, kb_search, session_manager, image_generator, tts_engine, stt_engine, media_player = init_app()
+(config, paths, workspace_manager, provider, kb_search, session_manager,
+ image_generator, tts_engine, stt_engine, media_player, jarvis_voice,
+ suite_client) = init_app()
 
 kb_doc_count = sum(1 for f in paths.kb.rglob("*") if f.is_file())
 
@@ -460,6 +496,42 @@ with st.sidebar:
         max_tok = st.number_input("Max tokens", 100, 4000, st.session_state.model_settings["max_tokens"], 100, key="max_tok_input")
         st.session_state.model_settings["max_tokens"] = max_tok
 
+    st.markdown("---")
+    st.markdown('<div class="jv-h3">Voice &amp; Suite</div>', unsafe_allow_html=True)
+
+    # Voice replies. Off by default — audio that starts on its own is
+    # hostile in a shared office, so the operator opts in.
+    voice_available = jarvis_voice.configured
+    st.checkbox(
+        "Speak replies",
+        value=False,
+        key="voice_enabled",
+        disabled=not voice_available,
+        help=(
+            "Jarvis reads each reply aloud in his own voice (OpenAI TTS)."
+            if voice_available
+            else "Needs OPENAI_API_KEY."
+        ),
+    )
+    if st.session_state.get("voice_enabled"):
+        st.slider("Speaking rate", 0.75, 1.25, 1.0, 0.05, key="voice_speed")
+
+    # Live suite context. Also opt-in: it adds a round trip and a few
+    # thousand tokens to every turn.
+    suite_available = suite_client.configured
+    st.checkbox(
+        "Suite context",
+        value=False,
+        key="suite_context_enabled",
+        disabled=not suite_available,
+        help=(
+            "Attach the live Command Center briefing so Jarvis can answer "
+            "from real suite state."
+            if suite_available
+            else "Needs SUITE_AGENT_BRIEFING_TOKEN."
+        ),
+    )
+
 # ====== MAIN CONTENT ======
 st.markdown('<h1>Jarvis Console</h1>', unsafe_allow_html=True)
 st.markdown(
@@ -550,8 +622,8 @@ for i, (api_name, models, ping_fn) in enumerate(apis):
 st.markdown("---")
 
 # Main tabs
-tab_chat, tab_kb, tab_sessions, tab_tools, tab_media, tab_settings = st.tabs([
-    "Chat", "Knowledge", "Sessions", "Tools", "Media", "Settings"
+tab_chat, tab_suite, tab_kb, tab_sessions, tab_tools, tab_media, tab_settings = st.tabs([
+    "Chat", "Suite", "Knowledge", "Sessions", "Tools", "Media", "Settings"
 ])
 
 # ====== CHAT TAB ======
@@ -606,11 +678,18 @@ with tab_chat:
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
+    # Set by the generation block below, consumed once here: only the
+    # reply that was just produced should play on its own. Re-rendering
+    # history must never restart old audio.
+    pending_autoplay = st.session_state.pop("pending_autoplay", None)
+
     chat_container = st.container()
     with chat_container:
-        for message in st.session_state.messages:
+        for idx, message in enumerate(st.session_state.messages):
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
+                if message.get("audio"):
+                    _render_audio(message["audio"], autoplay=(idx == pending_autoplay))
 
     col1, col2 = st.columns([20, 1])
 
@@ -636,12 +715,50 @@ with tab_chat:
 
                             context = "\n\n".join([r.content for r in kb_results]) if kb_results else ""
 
+                            # Live suite state, when the operator asked
+                            # for it. A failure here is reported but
+                            # never blocks the reply — Jarvis answering
+                            # without the briefing beats no answer.
+                            suite_context = ""
+                            if st.session_state.get("suite_context_enabled"):
+                                try:
+                                    suite_context = suite_client.fetch().to_prompt_context()
+                                except SuiteUnavailable as exc:
+                                    st.warning(f"Suite context unavailable: {exc}")
+
                             system_msg = system_prompt if system_prompt else (workspace.system_prompt if current_workspace else "")
-                            full_prompt = f"{system_msg}\n\nContext:\n{context}\n\nUser: {final_prompt}"
+                            if suite_context:
+                                system_msg = (
+                                    f"{system_msg}\n\n{JARVIS_SUITE_PERSONA}"
+                                    if system_msg
+                                    else JARVIS_SUITE_PERSONA
+                                )
+
+                            prompt_parts = [system_msg]
+                            if suite_context:
+                                prompt_parts.append(f"Live suite state:\n{suite_context}")
+                            if context:
+                                prompt_parts.append(f"Context:\n{context}")
+                            prompt_parts.append(f"User: {final_prompt}")
+                            full_prompt = "\n\n".join(p for p in prompt_parts if p)
 
                             response = provider.generate_text(full_prompt)
                             st.markdown(response)
-                            st.session_state.messages.append({"role": "assistant", "content": response})
+
+                            reply = {"role": "assistant", "content": response}
+
+                            if st.session_state.get("voice_enabled"):
+                                try:
+                                    reply["audio"] = jarvis_voice.speak(
+                                        response,
+                                        speed=st.session_state.get("voice_speed", 1.0),
+                                    )
+                                except Exception as exc:
+                                    st.warning(f"Voice unavailable: {exc}")
+
+                            st.session_state.messages.append(reply)
+                            if reply.get("audio"):
+                                st.session_state.pending_autoplay = len(st.session_state.messages) - 1
 
                             if include_context and kb_results:
                                 with st.expander("Context used"):
@@ -658,7 +775,12 @@ with tab_chat:
                                 new_session = session_manager.create_session(current_workspace, f"Chat {len(sessions) + 1}")
                                 session_manager.add_message(new_session.id, "user", prompt)
                                 session_manager.add_message(new_session.id, "assistant", response)
-                                st.rerun()
+
+                            # Re-render from history so the reply and its
+                            # audio player live in one place. st.rerun
+                            # raises BaseException, so the handler below
+                            # does not swallow it.
+                            st.rerun()
 
                         except Exception as e:
                             st.error(f"Error: {str(e)}")
@@ -666,6 +788,87 @@ with tab_chat:
     with col2:
         if st.button("Refresh", help="Refresh", key="refresh_chat"):
             st.rerun()
+
+# ====== SUITE TAB ======
+with tab_suite:
+    st.markdown('<h3>MacTech Suite — live state</h3>', unsafe_allow_html=True)
+
+    if not suite_client.configured:
+        st.info(
+            "Jarvis is not connected to the Suite. Set `SUITE_AGENT_BRIEFING_TOKEN` "
+            "(and `SUITE_BASE_URL` if it is not the production host) on this service, "
+            "matching the value on the Suite."
+        )
+    else:
+        col_a, col_b = st.columns([1, 5])
+        with col_a:
+            refresh_suite = st.button("Refresh", key="refresh_suite", use_container_width=True)
+
+        try:
+            briefing = suite_client.fetch(force=refresh_suite)
+        except SuiteUnavailable as exc:
+            briefing = None
+            st.error(str(exc))
+
+        if briefing:
+            with col_b:
+                st.caption(f"Briefing generated {briefing.generated_at}")
+
+            status = briefing.status
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Registered apps", status.get("totalApps", "—"))
+            m2.metric("Open risks", status.get("openRiskCount", 0))
+            m3.metric("Critical / high", status.get("criticalRiskCount", 0))
+            m4.metric("Unhealthy apps", len(briefing.unhealthy_apps))
+
+            unhealthy = briefing.unhealthy_apps
+            if unhealthy:
+                st.markdown('<div class="jv-h3">Needs attention</div>', unsafe_allow_html=True)
+                for app in unhealthy:
+                    health = app.get("health") or {}
+                    st.markdown(
+                        f"**{app.get('name')}** — {health.get('status')}"
+                        f" (HTTP {health.get('statusCode') or 'n/a'})"
+                    )
+
+            st.markdown('<div class="jv-h3">Apps</div>', unsafe_allow_html=True)
+            st.dataframe(
+                [
+                    {
+                        "App": a.get("name"),
+                        "Key": a.get("appKey"),
+                        "Health": (a.get("health") or {}).get("status", "unknown"),
+                        "Criticality": a.get("criticality"),
+                        "Risks": len(a.get("openRisks") or []),
+                        "Repo": a.get("repoFullName") or "—",
+                    }
+                    for a in briefing.apps
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            if briefing.deployments:
+                st.markdown('<div class="jv-h3">Deployments</div>', unsafe_allow_html=True)
+                st.dataframe(
+                    [
+                        {
+                            "Service": d.get("serviceName") or "—",
+                            "Project": d.get("projectName") or "—",
+                            "App": d.get("appKey") or "—",
+                            "Status": (d.get("latest") or {}).get("status", "—"),
+                            "Branch": (d.get("latest") or {}).get("branch") or "—",
+                            "Commit": (d.get("latest") or {}).get("commitSha") or "—",
+                            "Drift": (d.get("latest") or {}).get("driftStatus") or "—",
+                        }
+                        for d in briefing.deployments
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            with st.expander("Briefing as sent to the model"):
+                st.code(briefing.to_prompt_context(), language="text")
 
 # ====== KNOWLEDGE BASE TAB ======
 with tab_kb:
