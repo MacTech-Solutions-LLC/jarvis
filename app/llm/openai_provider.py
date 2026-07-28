@@ -3,6 +3,7 @@
 import httpx
 from typing import Optional
 from app.core.config import Config
+from app.core.openai_errors import raise_for_openai_status
 
 class OpenAIProvider:
     """OpenAI API provider"""
@@ -28,7 +29,7 @@ class OpenAIProvider:
         }
 
         response = self.client.post(f"{self.base_url}/chat/completions", json=payload)
-        response.raise_for_status()
+        raise_for_openai_status(response)
 
         data = response.json()
         return data["choices"][0]["message"]["content"].strip()

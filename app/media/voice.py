@@ -21,6 +21,7 @@ from typing import Optional
 import httpx
 
 from app.core.config import Config
+from app.core.openai_errors import explain_openai_failure
 from app.core.paths import Paths
 
 # Deep and measured. Of OpenAI's voices this is the one that reads as a
@@ -48,33 +49,6 @@ MAX_INPUT_CHARS = 4000
 
 class VoiceError(RuntimeError):
     """Speech synthesis failed, with a message worth showing an operator."""
-
-
-def _explain_failure(response: httpx.Response) -> str:
-    """Turn an OpenAI error response into something actionable.
-
-    A raw 429 reads as "try again later", which is wrong and wastes an
-    operator's afternoon when the real cause is an unfunded account.
-    """
-    try:
-        error = response.json().get("error", {})
-    except Exception:
-        error = {}
-
-    code = error.get("code") or ""
-    message = error.get("message") or response.text[:200]
-
-    if code == "insufficient_quota":
-        return (
-            "The OpenAI account has no remaining quota, so Jarvis cannot speak. "
-            "Add credit or raise the billing limit at "
-            "platform.openai.com/settings/organization/billing, then try again."
-        )
-    if response.status_code == 401:
-        return "OpenAI rejected the API key (401). Check OPENAI_API_KEY."
-    if response.status_code == 429:
-        return f"OpenAI is rate limiting speech requests. {message}"
-    return f"Speech synthesis failed (HTTP {response.status_code}). {message}"
 
 
 class JarvisVoice:
@@ -136,7 +110,7 @@ class JarvisVoice:
                 response = client.post(f"{self.base_url}/audio/speech", json=fallback)
 
             if response.status_code != 200:
-                raise VoiceError(_explain_failure(response))
+                raise VoiceError(explain_openai_failure(response))
 
             return response.content
 

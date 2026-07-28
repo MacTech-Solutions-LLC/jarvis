@@ -13,7 +13,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.media.voice import _explain_failure, _strip_for_speech
+from app.core.openai_errors import explain_openai_failure
+from app.media.voice import _strip_for_speech
 from app.suite.client import SuiteBriefing, SuiteClient, SuiteUnavailable
 
 
@@ -148,7 +149,7 @@ def test_quota_exhaustion_is_not_reported_as_rate_limiting():
     # OpenAI returns 429 for both "slow down" and "you have no money".
     # Only the second is actionable, and conflating them sends an
     # operator off to wait for a limit that will never clear.
-    message = _explain_failure(
+    message = explain_openai_failure(
         _response(429, {"error": {"code": "insufficient_quota", "message": "quota"}})
     )
     assert "no remaining quota" in message
@@ -156,14 +157,14 @@ def test_quota_exhaustion_is_not_reported_as_rate_limiting():
 
 
 def test_real_rate_limiting_still_reads_as_rate_limiting():
-    message = _explain_failure(
+    message = explain_openai_failure(
         _response(429, {"error": {"code": "rate_limit_exceeded", "message": "slow down"}})
     )
     assert "rate limiting" in message
 
 
 def test_bad_key_is_named_as_a_key_problem():
-    message = _explain_failure(
+    message = explain_openai_failure(
         _response(401, {"error": {"code": "invalid_api_key", "message": "nope"}})
     )
     assert "OPENAI_API_KEY" in message
