@@ -74,76 +74,133 @@ class SuiteBriefing:
         the assistant can quote figures without inventing them.
         """
         lines: list[str] = []
-        lines.append(f"MACTECH SUITE — LIVE OPS BRIEFING (generated {self.generated_at})")
-
         s = self.status
-        lines.append("")
-        lines.append("Overview:")
-        lines.append(f"  Registered active apps: {s.get('totalApps', 'unknown')}")
+
         by_health = s.get("byHealth") or {}
-        if by_health:
-            health_str = ", ".join(f"{k}={v}" for k, v in by_health.items())
-            lines.append(f"  Health breakdown: {health_str}")
-        lines.append(f"  Open risk flags: {s.get('openRiskCount', 0)}")
-        lines.append(f"  Critical/high risks: {s.get('criticalRiskCount', 0)}")
-        if s.get("appsMissingHealthUrl"):
-            lines.append(f"  Apps with no health endpoint: {s.get('appsMissingHealthUrl')}")
+        health_str = " ".join(f"{k}={v}" for k, v in by_health.items() if v)
+        lines.append(f"MACTECH SUITE — LIVE OPS ({_short_time(self.generated_at)})")
+        lines.append(
+            f"{s.get('totalApps', '?')} active apps ({health_str}); "
+            f"{s.get('openRiskCount', 0)} open risks, "
+            f"{s.get('criticalRiskCount', 0)} critical/high"
+        )
         if s.get("lastReconciliationAt"):
             lines.append(
-                f"  Last reconciliation: {s.get('lastReconciliationAt')}"
-                f" ({s.get('lastReconciliationOutcome') or 'unknown'})"
+                f"Reconciled {_short_time(s['lastReconciliationAt'])}"
+                f" ({s.get('lastReconciliationOutcome') or 'unknown'})."
+                " Repos are MacTech-Solutions-LLC/* unless shown otherwise."
             )
 
-        lines.append("")
-        lines.append("Apps:")
-        for app in self.apps[:max_apps]:
-            health = app.get("health") or {}
-            health_str = health.get("status", "unknown")
-            if health.get("latencyMs") is not None:
-                health_str += f" ({health['latencyMs']}ms)"
-            bits = [
-                f"  - {app.get('name')} [{app.get('appKey')}]",
-                f"health={health_str}",
-                f"criticality={app.get('criticality')}",
-                f"lifecycle={app.get('lifecycle')}",
-            ]
-            if app.get("repoFullName"):
-                bits.append(f"repo={app['repoFullName']}")
-            if app.get("publicUrl"):
-                bits.append(f"url={app['publicUrl']}")
-            lines.append(" | ".join(bits))
-            for risk in app.get("openRisks") or []:
+        # Apps split by whether they need a decision. Anything unhealthy
+        # or carrying a risk gets full detail — that is what gets asked
+        # about. The healthy remainder collapses to a name list: naming
+        # them proves they exist and are fine, which is all a reply needs.
+        flagged = [a for a in self.apps if _needs_attention(a)]
+        clean = [a for a in self.apps if not _needs_attention(a)]
+
+        if flagged:
+            lines.append("")
+            lines.append("NEEDS ATTENTION:")
+            for app in flagged[:max_apps]:
+                health = app.get("health") or {}
+                bits = [
+                    f"- {app.get('name')} [{app.get('appKey')}]",
+                    health.get("status", "unknown"),
+                    str(app.get("criticality")),
+                ]
+                if app.get("lifecycle") and app["lifecycle"] != "production":
+                    bits.append(str(app["lifecycle"]))
+                if app.get("repoFullName"):
+                    bits.append(_short_repo(app["repoFullName"]))
+                lines.append(" | ".join(bits))
+                for risk in app.get("openRisks") or []:
+                    title = _trim_prefix(risk.get("title") or "", app.get("name") or "")
+                    lines.append(
+                        f"    [{risk.get('severity')}] {risk.get('category')} — {title}"
+                    )
+
+        if clean:
+            lines.append("")
+            lines.append(
+                f"HEALTHY, NO RISKS ({len(clean)}): "
+                + ", ".join(a.get("appKey", "?") for a in clean)
+            )
+
+        # Deployments: a service that deployed successfully and is in
+        # sync tells you nothing you would ask about. Print the
+        # exceptions and count the rest.
+        if self.deployments:
+            odd = [d for d in self.deployments if _deploy_is_notable(d)]
+            lines.append("")
+            if odd:
+                lines.append("DEPLOYMENTS — NOTABLE:")
+                for dep in odd:
+                    latest = dep.get("latest") or {}
+                    bits = [f"- {dep.get('serviceName') or '?'}"]
+                    if dep.get("appKey"):
+                        bits.append(f"app={dep['appKey']}")
+                    if latest.get("status"):
+                        bits.append(str(latest["status"]))
+                    if latest.get("commitSha"):
+                        bits.append(f"{latest.get('branch') or '?'} {latest['commitSha']}")
+                    drift = latest.get("driftStatus")
+                    if drift and drift not in {"unknown", "in_sync"}:
+                        behind = latest.get("commitsBehind")
+                        bits.append(f"{drift}{f' by {behind}' if behind else ''}")
+                    lines.append(" | ".join(bits))
+            rest = len(self.deployments) - len(odd)
+            if rest > 0:
                 lines.append(
-                    f"      risk: [{risk.get('severity')}] "
-                    f"{risk.get('category')} — {risk.get('title')}"
+                    f"{rest} other services: latest deploy succeeded, no drift flagged."
                 )
 
-        if self.deployments:
-            lines.append("")
-            lines.append("Deployments (Railway):")
-            for dep in self.deployments:
-                latest = dep.get("latest") or {}
-                bits = [
-                    f"  - {dep.get('serviceName') or 'unknown'}"
-                    f" ({dep.get('projectName') or 'unknown'}/"
-                    f"{dep.get('environmentName') or 'unknown'})",
-                ]
-                if dep.get("appKey"):
-                    bits.append(f"app={dep['appKey']}")
-                if latest.get("status"):
-                    bits.append(f"status={latest['status']}")
-                if latest.get("branch"):
-                    bits.append(f"branch={latest['branch']}")
-                if latest.get("commitSha"):
-                    bits.append(f"commit={latest['commitSha']}")
-                if latest.get("driftStatus") and latest["driftStatus"] != "unknown":
-                    drift = latest["driftStatus"]
-                    if latest.get("commitsBehind"):
-                        drift += f" ({latest['commitsBehind']} behind)"
-                    bits.append(f"drift={drift}")
-                lines.append(" | ".join(bits))
-
         return "\n".join(lines)
+
+
+def _needs_attention(app: dict[str, Any]) -> bool:
+    return bool(
+        (app.get("health") or {}).get("status") in {"down", "degraded"}
+        or app.get("openRisks")
+    )
+
+
+# Drift values that mean production actually diverges from the repo.
+# "unknown" is excluded deliberately: it means the comparison could not
+# be computed, which is not something to act on, and printing ~5 such
+# rows costs tokens while telling the model nothing.
+REAL_DRIFT = {"behind", "ahead", "diverged"}
+
+
+def _deploy_is_notable(dep: dict[str, Any]) -> bool:
+    """True when a deploy failed, is missing, or genuinely drifted."""
+    latest = dep.get("latest")
+    if not latest:
+        return True
+    if latest.get("status") != "success":
+        return True
+    return latest.get("driftStatus") in REAL_DRIFT
+
+
+def _short_time(timestamp: str) -> str:
+    """2026-07-28T06:20:23.990Z -> 07-28 06:20Z. Seconds never matter here."""
+    if not timestamp or len(timestamp) < 16:
+        return timestamp or "unknown"
+    return f"{timestamp[5:10]} {timestamp[11:16]}Z"
+
+
+def _short_repo(full_name: str) -> str:
+    """Drop the org prefix that is identical across ~20 of the repos."""
+    prefix = "MacTech-Solutions-LLC/"
+    return full_name[len(prefix):] if full_name.startswith(prefix) else full_name
+
+
+def _trim_prefix(title: str, app_name: str) -> str:
+    """Risk titles repeat the app name already printed on the line above."""
+    if app_name and title.startswith(app_name):
+        trimmed = title[len(app_name):].lstrip(" -—:")
+        if trimmed:
+            return trimmed[0].upper() + trimmed[1:]
+    return title
 
 
 class SuiteClient:
