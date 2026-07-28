@@ -401,11 +401,18 @@ kb_doc_count = sum(1 for f in paths.kb.rglob("*") if f.is_file())
 # ====== SESSION STATE INITIALIZATION ======
 if "model_settings" not in st.session_state:
     st.session_state.model_settings = {
-        "text_model": "gpt-4",
+        # gpt-4o-mini by default: this console asks short operational
+        # questions over a briefing that is already summarised, and
+        # legacy gpt-4 costs orders of magnitude more per token for no
+        # gain on that workload.
+        "text_model": "gpt-4o-mini",
         "text_provider": "openai",
         "temperature": 0.7,
         "top_p": 1.0,
-        "max_tokens": 2000,
+        # Was never applied before (generate_text defaulted to 1000);
+        # keep that ceiling rather than silently doubling spend now
+        # that the setting is wired through. Raise it in Parameters.
+        "max_tokens": 1000,
         "image_model": "dall-e-3",
         "tts_voice": "nova",
         "tts_provider": "openai",
@@ -413,7 +420,10 @@ if "model_settings" not in st.session_state:
 
 if "model_options" not in st.session_state:
     st.session_state.model_options = {
-        "openai": ["gpt-4", "gpt-4-turbo", "gpt-3.5-turbo"],
+        # Cheapest capable option first — it is the default, and the
+        # order is what an operator scans. Legacy gpt-4 stays available
+        # but last; it costs far more per token than gpt-4o.
+        "openai": ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo", "gpt-4"],
         "anthropic": ["claude-3-opus", "claude-3-sonnet", "claude-3-haiku"],
         "groq": ["mixtral-8x7b", "llama2-70b"],
     }
@@ -742,7 +752,16 @@ with tab_chat:
                             prompt_parts.append(f"User: {final_prompt}")
                             full_prompt = "\n\n".join(p for p in prompt_parts if p)
 
-                            response = provider.generate_text(full_prompt)
+                            # Honour the sidebar selection. These were
+                            # collected into model_settings but never
+                            # passed, so every turn silently ran on the
+                            # generate_text default (legacy gpt-4).
+                            settings = st.session_state.model_settings
+                            response = provider.generate_text(
+                                full_prompt,
+                                model=settings["text_model"],
+                                max_tokens=int(settings["max_tokens"]),
+                            )
                             st.markdown(response)
 
                             reply = {"role": "assistant", "content": response}
@@ -867,8 +886,13 @@ with tab_suite:
                     hide_index=True,
                 )
 
+            prompt_context = briefing.to_prompt_context()
             with st.expander("Briefing as sent to the model"):
-                st.code(briefing.to_prompt_context(), language="text")
+                st.caption(
+                    f"{len(prompt_context):,} characters (~{len(prompt_context) // 4:,} "
+                    "tokens) added to each chat turn while Suite context is on."
+                )
+                st.code(prompt_context, language="text")
 
 # ====== KNOWLEDGE BASE TAB ======
 with tab_kb:

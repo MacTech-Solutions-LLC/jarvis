@@ -105,22 +105,78 @@ def test_unhealthy_apps_and_risk_count():
     assert briefing.risk_count == 1
 
 
-def test_prompt_context_includes_the_facts_a_reply_would_cite():
+def test_troubled_apps_keep_full_detail():
     context = SuiteBriefing.from_payload(SAMPLE_PAYLOAD).to_prompt_context()
-    # Names and keys so the model can refer to apps the way the operator does.
-    assert "MacTech Quality (QMS)" in context
-    assert "[jarvis]" in context
-    # Health, risk, and drift are the three things worth asking about.
-    assert "health=down" in context
+    # jarvis is down with a critical risk, so nothing about it may be
+    # compressed away — this is exactly what gets asked about.
+    assert "Jarvis [jarvis]" in context
+    assert "down" in context
     assert "critical" in context
-    assert "drift=behind (2 behind)" in context
+    assert "Health endpoint unreachable" in context
+    # Real drift stays visible.
+    assert "behind" in context
 
 
-def test_prompt_context_caps_app_count():
+def test_healthy_apps_collapse_to_a_name_list():
+    context = SuiteBriefing.from_payload(SAMPLE_PAYLOAD).to_prompt_context()
+    # QMS is healthy with no risks: its key proves it exists and is
+    # fine, but its latency, URL and full name are not worth tokens.
+    assert "HEALTHY, NO RISKS (1): quality" in context
+    assert "MacTech Quality (QMS)" not in context
+    assert "142" not in context
+
+
+def test_nominal_deployments_are_counted_not_listed():
     payload = dict(SAMPLE_PAYLOAD)
-    payload["apps"] = SAMPLE_PAYLOAD["apps"] * 30
-    context = SuiteBriefing.from_payload(payload).to_prompt_context(max_apps=5)
-    assert context.count("  - ") <= 5 + len(SAMPLE_PAYLOAD["deployments"])
+    payload["deployments"] = [
+        {
+            "appKey": "quality",
+            "serviceName": "qms",
+            "projectName": "QMS",
+            "environmentName": "production",
+            "latest": {"status": "success", "branch": "main", "driftStatus": "in_sync"},
+        },
+        # Drift that could not be computed is not actionable either.
+        {
+            "appKey": "training",
+            "serviceName": "training-hub",
+            "projectName": "Training",
+            "environmentName": "production",
+            "latest": {"status": "success", "branch": "main", "driftStatus": "unknown"},
+        },
+    ]
+    context = SuiteBriefing.from_payload(payload).to_prompt_context()
+    assert "qms" not in context
+    assert "training-hub" not in context
+    # Counted, never silently dropped.
+    assert "2 other services" in context
+
+
+def test_failed_deployment_is_always_listed():
+    payload = dict(SAMPLE_PAYLOAD)
+    payload["deployments"] = [
+        {
+            "appKey": "quality",
+            "serviceName": "qms",
+            "projectName": "QMS",
+            "environmentName": "production",
+            "latest": {"status": "failed", "branch": "main", "driftStatus": "in_sync"},
+        }
+    ]
+    context = SuiteBriefing.from_payload(payload).to_prompt_context()
+    assert "qms" in context
+    assert "failed" in context
+
+
+def test_compaction_actually_saves_tokens():
+    # Guards the optimisation itself: a briefing of 40 healthy apps must
+    # not scale linearly the way the original one-line-per-app did.
+    payload = dict(SAMPLE_PAYLOAD)
+    healthy = dict(SAMPLE_PAYLOAD["apps"][0])
+    payload["apps"] = [dict(healthy, appKey=f"app{i}") for i in range(40)]
+    payload["deployments"] = []
+    context = SuiteBriefing.from_payload(payload).to_prompt_context()
+    assert len(context) < 1000
 
 
 def test_client_without_token_refuses_to_fetch():
