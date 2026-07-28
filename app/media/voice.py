@@ -46,6 +46,37 @@ FALLBACK_MODEL = "tts-1-hd"
 MAX_INPUT_CHARS = 4000
 
 
+class VoiceError(RuntimeError):
+    """Speech synthesis failed, with a message worth showing an operator."""
+
+
+def _explain_failure(response: httpx.Response) -> str:
+    """Turn an OpenAI error response into something actionable.
+
+    A raw 429 reads as "try again later", which is wrong and wastes an
+    operator's afternoon when the real cause is an unfunded account.
+    """
+    try:
+        error = response.json().get("error", {})
+    except Exception:
+        error = {}
+
+    code = error.get("code") or ""
+    message = error.get("message") or response.text[:200]
+
+    if code == "insufficient_quota":
+        return (
+            "The OpenAI account has no remaining quota, so Jarvis cannot speak. "
+            "Add credit or raise the billing limit at "
+            "platform.openai.com/settings/organization/billing, then try again."
+        )
+    if response.status_code == 401:
+        return "OpenAI rejected the API key (401). Check OPENAI_API_KEY."
+    if response.status_code == 429:
+        return f"OpenAI is rate limiting speech requests. {message}"
+    return f"Speech synthesis failed (HTTP {response.status_code}). {message}"
+
+
 class JarvisVoice:
     """Speaks as Jarvis. Returns MP3 bytes; optionally writes a file."""
 
@@ -92,6 +123,8 @@ class JarvisVoice:
 
             # Older accounts / API versions may not have gpt-4o-mini-tts.
             # Retry once on the classic model, which has no `instructions`.
+            # Quota errors are deliberately excluded: they are account-wide,
+            # so a second model would fail identically.
             if response.status_code in (400, 403, 404):
                 fallback = {
                     "model": FALLBACK_MODEL,
@@ -102,7 +135,9 @@ class JarvisVoice:
                 }
                 response = client.post(f"{self.base_url}/audio/speech", json=fallback)
 
-            response.raise_for_status()
+            if response.status_code != 200:
+                raise VoiceError(_explain_failure(response))
+
             return response.content
 
     def speak_to_file(
