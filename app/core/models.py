@@ -10,6 +10,11 @@ class WorkspaceConfig(BaseModel):
     name: str
     slug: str
     description: str
+    # Loaded from the workspace's system.md by WorkspaceManager, which
+    # has always passed it to this constructor. Without the field
+    # declared, pydantic silently dropped it and every read raised
+    # AttributeError — declaring it is what makes system.md take effect.
+    system_prompt: str = ""
     default_text_model: str = "gpt-4"
     default_image_model: str = "dall-e-3"
     default_tts_model: str = "tts-1"
